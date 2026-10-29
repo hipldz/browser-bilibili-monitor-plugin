@@ -1,29 +1,42 @@
-// popup.js
-// 弹出页面脚本：展示标签页序号及标题，仅含音视频的标签页显示开关
+// 弹窗读取持久配置和当前会话任务；关闭弹窗不停止页面中的监控。
+const extensionApi = globalThis.browser || chrome;
 
-// 封装获取媒体存在性的函数，处理未注入错误
-async function getTabMediaInfo(tabId) {
-  return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, { action: "getStatus" }, async (resp) => {
-      if (chrome.runtime.lastError) {
-        // 未注入 content.js，则动态注入后重试
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            files: ["content.js"],
-          });
-          chrome.tabs.sendMessage(tabId, { action: "getStatus" }, (resp2) => {
-            if (chrome.runtime.lastError) return resolve({ hasMedia: false });
-            resolve({ hasMedia: !!resp2.hasMedia });
-          });
-        } catch (e) {
-          resolve({ hasMedia: false });
-        }
-      } else {
-        resolve({ hasMedia: !!resp.hasMedia });
-      }
+async function injectContentScript(tabId) {
+  if (extensionApi.scripting?.executeScript) {
+    await extensionApi.scripting.executeScript({
+      target: { tabId },
+      files: ["content.js"],
     });
-  });
+  } else {
+    await extensionApi.tabs.executeScript(tabId, { file: "content.js" });
+  }
+}
+
+async function getTabMediaInfo(tabId) {
+  try {
+    const response = await extensionApi.tabs.sendMessage(tabId, {
+      action: "getStatus",
+    });
+    return { hasMedia: !!response?.hasMedia };
+  } catch {
+    try {
+      await injectContentScript(tabId);
+      const response = await extensionApi.tabs.sendMessage(tabId, {
+        action: "getStatus",
+      });
+      return { hasMedia: !!response?.hasMedia };
+    } catch {
+      return { hasMedia: false };
+    }
+  }
+}
+
+async function requestTrackingState(message = { action: "getTrackingState" }) {
+  const response = await extensionApi.runtime.sendMessage(message);
+  if (!response?.success || !Array.isArray(response.trackedTabIds)) {
+    throw new Error(response?.error || "无法获取监控状态");
+  }
+  return new Set(response.trackedTabIds);
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -34,42 +47,30 @@ document.addEventListener("DOMContentLoaded", async () => {
   tabsContainer.innerHTML = "<p>加载中...</p>";
 
   try {
-    let tabs = await chrome.tabs.query({});
-    if (!tabs || tabs.length === 0) {
-      tabsContainer.innerHTML = "<p>未发现标签页。</p>";
-      return;
-    }
-
-    const {
-      checkedTabs = {},
-      maskElementSelector = "",
-      maskElementEnabled = false,
-    } = await chrome.storage.local.get([
-      "checkedTabs",
-      "maskElementSelector",
-      "maskElementEnabled",
+    const [tabs, settings, trackedTabIds] = await Promise.all([
+      extensionApi.tabs.query({}),
+      extensionApi.storage.local.get([
+        "maskElementSelector",
+        "maskElementEnabled",
+      ]),
+      requestTrackingState(),
     ]);
+    const maskElementSelector =
+      typeof settings.maskElementSelector === "string"
+        ? settings.maskElementSelector.trim()
+        : "";
+    const maskElementEnabled = !!settings.maskElementEnabled;
 
-    if (maskInput) maskInput.value = maskElementSelector || "";
-    if (maskCheckbox) maskCheckbox.checked = !!maskElementEnabled;
+    if (maskInput) maskInput.value = maskElementSelector;
+    if (maskCheckbox) maskCheckbox.checked = maskElementEnabled;
 
-    let currentMaskSelector = maskElementSelector?.trim() || "";
-    let currentMaskEnabled = !!maskElementEnabled;
     const persistMaskSettings = async (selectorValue, enabled) => {
       const normalizedSelector = (selectorValue || "").trim();
-      if (
-        normalizedSelector === currentMaskSelector &&
-        enabled === currentMaskEnabled
-      ) {
-        return;
-      }
       try {
-        await chrome.storage.local.set({
+        await extensionApi.storage.local.set({
           maskElementSelector: normalizedSelector,
           maskElementEnabled: enabled,
         });
-        currentMaskSelector = normalizedSelector;
-        currentMaskEnabled = enabled;
       } catch {
         errorBox.textContent = "遮罩设置保存失败，请重试。";
         errorBox.style.display = "block";
@@ -77,36 +78,35 @@ document.addEventListener("DOMContentLoaded", async () => {
     };
 
     if (maskInput) {
-      maskInput.addEventListener("input", (e) => {
-        const enabled =
-          maskCheckbox && typeof maskCheckbox.checked === "boolean"
-            ? maskCheckbox.checked
-            : currentMaskEnabled;
-        void persistMaskSettings(e.target.value, enabled);
+      maskInput.addEventListener("input", (event) => {
+        void persistMaskSettings(
+          event.target.value,
+          maskCheckbox ? maskCheckbox.checked : maskElementEnabled
+        );
       });
     }
-
     if (maskCheckbox) {
-      maskCheckbox.addEventListener("change", (e) => {
-        const selectorValue =
-          maskInput && typeof maskInput.value === "string"
-            ? maskInput.value
-            : currentMaskSelector;
-        void persistMaskSettings(selectorValue, e.target.checked);
+      maskCheckbox.addEventListener("change", (event) => {
+        void persistMaskSettings(
+          maskInput ? maskInput.value : maskElementSelector,
+          event.target.checked
+        );
       });
     }
 
+    if (!tabs || tabs.length === 0) {
+      tabsContainer.innerHTML = "<p>未发现标签页。</p>";
+      return;
+    }
     tabs.sort((a, b) => a.index - b.index);
     tabsContainer.innerHTML = "";
 
     for (let idx = 0; idx < tabs.length; idx++) {
       const tab = tabs[idx];
       const { hasMedia } = await getTabMediaInfo(tab.id);
-
       const div = document.createElement("div");
       div.className = "tab";
 
-      // 左侧：序号 & 标题
       const left = document.createElement("div");
       left.className = "tab-left";
       const num = document.createElement("span");
@@ -117,37 +117,37 @@ document.addEventListener("DOMContentLoaded", async () => {
       info.textContent = tab.title || tab.url;
       left.append(num, info);
 
-      // 右侧：仅有媒体时显示开关
       const right = document.createElement("div");
       right.className = "tab-right";
-      if (hasMedia) {
+      // 媒体暂时消失时，仍允许关闭已经启动的任务。
+      if (hasMedia || trackedTabIds.has(tab.id)) {
         const label = document.createElement("label");
         label.className = "switch";
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
-        checkbox.checked = !!checkedTabs[tab.id];
+        checkbox.checked = trackedTabIds.has(tab.id);
         const slider = document.createElement("span");
         slider.className = "slider";
         label.append(checkbox, slider);
-        checkbox.addEventListener("change", async (e) => {
+        checkbox.addEventListener("change", async () => {
+          const wasTracked = trackedTabIds.has(tab.id);
+          const enable = checkbox.checked;
+          checkbox.disabled = true;
           try {
-            await new Promise((res) =>
-              chrome.runtime.sendMessage(
-                {
-                  action: "toggleTrack",
-                  tabId: tab.id,
-                  enable: e.target.checked,
-                },
-                res
-              )
-            );
-            const newChecked = { ...checkedTabs };
-            if (e.target.checked) newChecked[tab.id] = true;
-            else delete newChecked[tab.id];
-            await chrome.storage.local.set({ checkedTabs: newChecked });
+            const updated = await requestTrackingState({
+              action: "toggleTrack",
+              tabId: tab.id,
+              enable,
+            });
+            checkbox.checked = updated.has(tab.id);
+            if (checkbox.checked) trackedTabIds.add(tab.id);
+            else trackedTabIds.delete(tab.id);
           } catch {
+            checkbox.checked = wasTracked;
             errorBox.textContent = "操作失败，请重试。";
             errorBox.style.display = "block";
+          } finally {
+            checkbox.disabled = false;
           }
         });
         right.append(label);
@@ -156,7 +156,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       div.append(left, right);
       tabsContainer.append(div);
     }
-  } catch (err) {
+  } catch {
     errorBox.textContent = "加载失败，请刷新。";
     errorBox.style.display = "block";
     tabsContainer.innerHTML = "";
